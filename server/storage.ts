@@ -1,41 +1,76 @@
 import { 
-  products, orders, orderItems, inventoryLogs,
+  products, orders, orderItems, inventoryLogs, stores,
   type Product, type InsertProduct,
   type Order, type InsertOrder,
   type OrderItem, type InsertOrderItem,
-  type OrderWithItems
+  type OrderWithItems, type Store, type InsertStore
 } from "@shared/schema";
 import { db } from "./db";
 import { eq, desc, and } from "drizzle-orm";
 import { authStorage, type IAuthStorage } from "./replit_integrations/auth";
 
 export interface IStorage extends IAuthStorage {
+  // Stores
+  getStores(): Promise<Store[]>;
+  getStoreBySlug(slug: string): Promise<Store | undefined>;
+  getStoreById(id: number): Promise<Store | undefined>;
+  createStore(store: InsertStore): Promise<Store>;
+  updateStore(id: number, store: Partial<InsertStore>): Promise<Store>;
+
   // Products
-  getProducts(category?: string): Promise<Product[]>;
+  getProducts(filters?: { category?: string; storeId?: number }): Promise<Product[]>;
   getProduct(id: number): Promise<Product | undefined>;
   createProduct(product: InsertProduct): Promise<Product>;
   updateProduct(id: number, product: Partial<InsertProduct>): Promise<Product>;
   deleteProduct(id: number): Promise<void>;
 
   // Orders
-  getOrders(userId?: string): Promise<OrderWithItems[]>; // If userId provided, filter by it
+  getOrders(filters?: { userId?: string; storeId?: number }): Promise<OrderWithItems[]>;
   getOrder(id: number): Promise<OrderWithItems | undefined>;
-  createOrder(userId: string, orderData: { paymentMethod: string; total: number }, items: { productId: number; quantity: number; price: number }[]): Promise<Order>;
+  createOrder(userId: string, orderData: { storeId: number; paymentMethod: string; total: number }, items: { productId: number; quantity: number; price: number }[]): Promise<Order>;
   updateOrderStatus(id: number, status: string): Promise<Order>;
   
   // Analytics
-  getSalesData(): Promise<{ totalSales: number; count: number }>;
+  getSalesData(storeId?: number): Promise<{ totalSales: number; count: number }>;
 }
 
 export class DatabaseStorage implements IStorage {
-  // Auth methods delegated to authStorage
   getUser = authStorage.getUser.bind(authStorage);
   upsertUser = authStorage.upsertUser.bind(authStorage);
 
+  // Stores
+  async getStores(): Promise<Store[]> {
+    return await db.select().from(stores);
+  }
+
+  async getStoreBySlug(slug: string): Promise<Store | undefined> {
+    const [store] = await db.select().from(stores).where(eq(stores.slug, slug));
+    return store;
+  }
+
+  async getStoreById(id: number): Promise<Store | undefined> {
+    const [store] = await db.select().from(stores).where(eq(stores.id, id));
+    return store;
+  }
+
+  async createStore(insertStore: InsertStore): Promise<Store> {
+    const [store] = await db.insert(stores).values(insertStore).returning();
+    return store;
+  }
+
+  async updateStore(id: number, updates: Partial<InsertStore>): Promise<Store> {
+    const [store] = await db.update(stores).set(updates).where(eq(stores.id, id)).returning();
+    return store;
+  }
+
   // Products
-  async getProducts(category?: string): Promise<Product[]> {
-    if (category) {
-      return await db.select().from(products).where(eq(products.category, category));
+  async getProducts(filters?: { category?: string; storeId?: number }): Promise<Product[]> {
+    let whereClauses = [];
+    if (filters?.category) whereClauses.push(eq(products.category, filters.category));
+    if (filters?.storeId) whereClauses.push(eq(products.storeId, filters.storeId));
+    
+    if (whereClauses.length > 0) {
+      return await db.select().from(products).where(and(...whereClauses));
     }
     return await db.select().from(products);
   }
@@ -64,17 +99,18 @@ export class DatabaseStorage implements IStorage {
   }
 
   // Orders
-  async getOrders(userId?: string): Promise<OrderWithItems[]> {
-    let query = db.select().from(orders).orderBy(desc(orders.createdAt));
+  async getOrders(filters?: { userId?: string; storeId?: number }): Promise<OrderWithItems[]> {
+    let whereClauses = [];
+    if (filters?.userId) whereClauses.push(eq(orders.userId, filters.userId));
+    if (filters?.storeId) whereClauses.push(eq(orders.storeId, filters.storeId));
     
-    if (userId) {
+    let query = db.select().from(orders).orderBy(desc(orders.createdAt));
+    if (whereClauses.length > 0) {
       // @ts-ignore
-      query = query.where(eq(orders.userId, userId));
+      query = query.where(and(...whereClauses));
     }
     
     const ordersList = await query;
-    
-    // Fetch items for each order (could be optimized with join, but this is simple)
     const ordersWithItems: OrderWithItems[] = [];
     
     for (const order of ordersList) {
@@ -125,19 +161,17 @@ export class DatabaseStorage implements IStorage {
     };
   }
 
-  async createOrder(userId: string, orderData: { paymentMethod: string; total: number }, items: { productId: number; quantity: number; price: number }[]): Promise<Order> {
-    // Start transaction
+  async createOrder(userId: string, orderData: { storeId: number; paymentMethod: string; total: number }, items: { productId: number; quantity: number; price: number }[]): Promise<Order> {
     return await db.transaction(async (tx) => {
-      // Create Order
       const [order] = await tx.insert(orders).values({
         userId,
+        storeId: orderData.storeId,
         total: orderData.total,
         paymentMethod: orderData.paymentMethod,
-        status: "paid", // Assume paid for simplicity of mock
+        status: "paid",
         paymentStatus: "paid"
       }).returning();
 
-      // Create Order Items and Update Stock
       for (const item of items) {
         await tx.insert(orderItems).values({
           orderId: order.id,
@@ -146,14 +180,12 @@ export class DatabaseStorage implements IStorage {
           price: item.price
         });
 
-        // Decrement stock
         const [product] = await tx.select().from(products).where(eq(products.id, item.productId));
         if (product) {
           await tx.update(products)
             .set({ stock: product.stock - item.quantity })
             .where(eq(products.id, item.productId));
             
-          // Log inventory change
           await tx.insert(inventoryLogs).values({
             productId: item.productId,
             change: -item.quantity,
@@ -171,8 +203,13 @@ export class DatabaseStorage implements IStorage {
     return order;
   }
 
-  async getSalesData(): Promise<{ totalSales: number; count: number }> {
-    const allOrders = await db.select().from(orders).where(eq(orders.status, "paid")); // or delivered
+  async getSalesData(storeId?: number): Promise<{ totalSales: number; count: number }> {
+    let query = db.select().from(orders).where(eq(orders.status, "paid"));
+    if (storeId) {
+      // @ts-ignore
+      query = query.where(eq(orders.storeId, storeId));
+    }
+    const allOrders = await query;
     const totalSales = allOrders.reduce((sum, order) => sum + order.total, 0);
     return { totalSales, count: allOrders.length };
   }

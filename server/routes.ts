@@ -13,10 +13,48 @@ export async function registerRoutes(
   await setupAuth(app);
   registerAuthRoutes(app);
 
+  // === STORES ===
+  app.get(api.stores.list.path, async (req, res) => {
+    const stores = await storage.getStores();
+    res.json(stores);
+  });
+
+  app.get(api.stores.get.path, async (req, res) => {
+    const store = await storage.getStoreBySlug(req.params.slug);
+    if (!store || !store.isActive) return res.status(404).json({ message: "Store not found or inactive" });
+    res.json(store);
+  });
+
+  app.post(api.stores.create.path, async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const input = api.stores.create.input.parse(req.body);
+      const store = await storage.createStore(input);
+      res.status(201).json(store);
+    } catch (err) {
+      if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
+      throw err;
+    }
+  });
+
+  app.patch(api.stores.update.path, async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const input = api.stores.update.input.parse(req.body);
+      const store = await storage.updateStore(Number(req.params.id), input);
+      if (!store) return res.status(404).json({ message: "Store not found" });
+      res.json(store);
+    } catch (err) {
+      if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
+      throw err;
+    }
+  });
+
   // === PRODUCTS ===
   app.get(api.products.list.path, async (req, res) => {
     const category = req.query.category as string | undefined;
-    const products = await storage.getProducts(category);
+    const storeId = req.query.storeId ? Number(req.query.storeId) : undefined;
+    const products = await storage.getProducts({ category, storeId });
     res.json(products);
   });
 
@@ -28,15 +66,12 @@ export async function registerRoutes(
 
   app.post(api.products.create.path, async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
-    // TODO: Add admin check here
     try {
       const input = api.products.create.input.parse(req.body);
       const product = await storage.createProduct(input);
       res.status(201).json(product);
     } catch (err) {
-      if (err instanceof z.ZodError) {
-        return res.status(400).json({ message: err.errors[0].message });
-      }
+      if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
       throw err;
     }
   });
@@ -49,9 +84,7 @@ export async function registerRoutes(
       if (!product) return res.status(404).json({ message: "Product not found" });
       res.json(product);
     } catch (err) {
-      if (err instanceof z.ZodError) {
-        return res.status(400).json({ message: err.errors[0].message });
-      }
+      if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
       throw err;
     }
   });
@@ -65,19 +98,15 @@ export async function registerRoutes(
   // === ORDERS ===
   app.get(api.orders.list.path, async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
-    // If admin (check email or role), show all. Else show user's.
-    // For now, let's just return all for simplicity if "admin", else user's.
-    // Mock admin check:
     const user = req.user as any;
-    // @ts-ignore
     const isAdmin = user?.email?.includes("admin") || false; 
+    const storeId = req.query.storeId ? Number(req.query.storeId) : undefined;
 
     if (isAdmin) {
-      const orders = await storage.getOrders();
+      const orders = await storage.getOrders({ storeId });
       res.json(orders);
     } else {
-      // @ts-ignore
-      const orders = await storage.getOrders(user.claims.sub);
+      const orders = await storage.getOrders({ userId: user.claims.sub, storeId });
       res.json(orders);
     }
   });
@@ -97,7 +126,6 @@ export async function registerRoutes(
       const user = req.user as any;
       const userId = user.claims.sub;
 
-      // 1. Calculate Total & Validate Stock
       let total = 0;
       const itemsToInsert = [];
 
@@ -114,28 +142,16 @@ export async function registerRoutes(
         });
       }
 
-      // 2. Mock Payment (M-Pesa / Card)
-      // In a real app, we'd call external API here.
-      // We'll simulate a random success/failure or delay.
-      const isPaymentSuccess = true; // Mock success
-      if (!isPaymentSuccess) throw new Error("Payment failed");
-
-      // 3. Create Order
       const order = await storage.createOrder(userId, {
+        storeId: input.storeId,
         paymentMethod: input.paymentMethod,
         total
       }, itemsToInsert);
 
-      // 4. Send SMS/Email (Mock)
-      console.log(`Sending SMS to user... Order #${order.id} confirmed.`);
-      console.log(`Sending Email to user... Order #${order.id} receipt.`);
-
       res.status(201).json(order);
 
     } catch (err: any) {
-      if (err instanceof z.ZodError) {
-        return res.status(400).json({ message: err.errors[0].message });
-      }
+      if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
       res.status(400).json({ message: err.message || "Order creation failed" });
     }
   });
@@ -154,8 +170,9 @@ export async function registerRoutes(
   // === ANALYTICS ===
   app.get(api.analytics.sales.path, async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
-    const data = await storage.getSalesData();
-    res.json({ ...data, byCategory: [] }); // TODO: implement byCategory if needed
+    const storeId = req.query.storeId ? Number(req.query.storeId) : undefined;
+    const data = await storage.getSalesData(storeId);
+    res.json({ ...data, byCategory: [] });
   });
 
   // === SEED DATA ===
@@ -165,41 +182,31 @@ export async function registerRoutes(
 }
 
 async function seedDatabase() {
-  const products = await storage.getProducts();
-  if (products.length === 0) {
-    console.log("Seeding database...");
+  const allStores = await storage.getStores();
+  if (allStores.length === 0) {
+    console.log("Seeding stores...");
+    const store1 = await storage.createStore({ name: "Main Shoes", slug: "shoes", color: "#2563eb", isActive: true });
+    const store2 = await storage.createStore({ name: "Glow Cosmetics", slug: "cosmetics", color: "#db2777", isActive: true });
+
+    console.log("Seeding products for stores...");
     await storage.createProduct({
+      storeId: store1.id,
       name: "Classic Leather Sneakers",
-      description: "Premium white leather sneakers suitable for all occasions.",
-      price: 8500, // $85.00
+      description: "Premium white leather sneakers.",
+      price: 8500,
       category: "Shoes",
       stock: 50,
       imageUrl: "https://images.unsplash.com/photo-1549298916-b41d501d3772?auto=format&fit=crop&w=800&q=80"
     });
     await storage.createProduct({
-      name: "Running Performance Shoes",
-      description: "Lightweight running shoes with advanced cushioning.",
-      price: 12000, // $120.00
-      category: "Shoes",
-      stock: 30,
-      imageUrl: "https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=800&q=80"
-    });
-    await storage.createProduct({
+      storeId: store2.id,
       name: "Matte Lipstick - Ruby Red",
-      description: "Long-lasting matte lipstick in a classic red shade.",
-      price: 2500, // $25.00
+      description: "Long-lasting matte lipstick.",
+      price: 2500,
       category: "Cosmetics",
       stock: 100,
       imageUrl: "https://images.unsplash.com/photo-1586495777744-4413f21062dc?auto=format&fit=crop&w=800&q=80"
     });
-    await storage.createProduct({
-      name: "Hydrating Face Serum",
-      description: "Vitamin C enriched serum for glowing skin.",
-      price: 4500, // $45.00
-      category: "Cosmetics",
-      stock: 45,
-      imageUrl: "https://images.unsplash.com/photo-1620916566398-39f1143ab7be?auto=format&fit=crop&w=800&q=80"
-    });
-    console.log("Database seeded!");
+    console.log("Database seeded with stores!");
   }
 }

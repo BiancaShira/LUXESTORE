@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { insertProductSchema, insertOrderSchema, products, orders } from './schema';
+import { insertProductSchema, insertOrderSchema, insertStoreSchema, products, orders, stores } from './schema';
 
 export const errorSchemas = {
   validation: z.object({
@@ -18,12 +18,51 @@ export const errorSchemas = {
 };
 
 export const api = {
+  stores: {
+    list: {
+      method: 'GET' as const,
+      path: '/api/stores',
+      responses: {
+        200: z.array(z.custom<typeof stores.$inferSelect>()),
+      },
+    },
+    get: {
+      method: 'GET' as const,
+      path: '/api/stores/:slug',
+      responses: {
+        200: z.custom<typeof stores.$inferSelect>(),
+        404: errorSchemas.notFound,
+      },
+    },
+    create: {
+      method: 'POST' as const,
+      path: '/api/stores',
+      input: insertStoreSchema,
+      responses: {
+        201: z.custom<typeof stores.$inferSelect>(),
+        400: errorSchemas.validation,
+        401: errorSchemas.unauthorized,
+      },
+    },
+    update: {
+      method: 'PATCH' as const,
+      path: '/api/stores/:id',
+      input: insertStoreSchema.partial(),
+      responses: {
+        200: z.custom<typeof stores.$inferSelect>(),
+        400: errorSchemas.validation,
+        404: errorSchemas.notFound,
+        401: errorSchemas.unauthorized,
+      },
+    },
+  },
   products: {
     list: {
       method: 'GET' as const,
       path: '/api/products',
       input: z.object({
         category: z.string().optional(),
+        storeId: z.coerce.number().optional(),
       }).optional(),
       responses: {
         200: z.array(z.custom<typeof products.$inferSelect>()),
@@ -72,6 +111,9 @@ export const api = {
     list: {
       method: 'GET' as const,
       path: '/api/orders',
+      input: z.object({
+        storeId: z.coerce.number().optional(),
+      }).optional(),
       responses: {
         200: z.array(z.custom<any>()), // OrderWithItems
         401: errorSchemas.unauthorized,
@@ -90,6 +132,7 @@ export const api = {
       method: 'POST' as const,
       path: '/api/orders',
       input: z.object({
+        storeId: z.number(),
         items: z.array(z.object({
           productId: z.number(),
           quantity: z.number().min(1)
@@ -120,6 +163,9 @@ export const api = {
     sales: {
       method: 'GET' as const,
       path: '/api/analytics/sales',
+      input: z.object({
+        storeId: z.coerce.number().optional(),
+      }).optional(),
       responses: {
         200: z.custom<{ totalSales: number; count: number; byCategory: any[] }>(),
         401: errorSchemas.unauthorized,

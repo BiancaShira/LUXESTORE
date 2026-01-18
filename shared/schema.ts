@@ -7,9 +7,22 @@ import { z } from "zod";
 export * from "./models/auth";
 import { users } from "./models/auth";
 
+// === STORES ===
+export const stores = pgTable("stores", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull(),
+  slug: text("slug").notNull().unique(),
+  color: text("color").notNull().default("#3b82f6"),
+  isActive: boolean("is_active").notNull().default(true),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const insertStoreSchema = createInsertSchema(stores).omit({ id: true, createdAt: true });
+
 // === PRODUCTS ===
 export const products = pgTable("products", {
   id: serial("id").primaryKey(),
+  storeId: integer("store_id").references(() => stores.id), // Nullable for global products if needed, but per requirements we'll assign to stores
   name: text("name").notNull(),
   description: text("description").notNull(),
   price: integer("price").notNull(), // stored in cents
@@ -24,7 +37,8 @@ export const insertProductSchema = createInsertSchema(products).omit({ id: true,
 // === ORDERS ===
 export const orders = pgTable("orders", {
   id: serial("id").primaryKey(),
-  userId: varchar("user_id").notNull(), // references auth users.id implicitly (no FK constraint to avoid complexity with auth module separation, but logically linked)
+  userId: varchar("user_id").notNull(),
+  storeId: integer("store_id").references(() => stores.id),
   status: text("status").notNull().default("pending"), // 'pending', 'paid', 'shipped', 'delivered', 'cancelled'
   total: integer("total").notNull(),
   paymentMethod: text("payment_method").notNull(), // 'mpesa', 'card'
@@ -55,15 +69,26 @@ export const inventoryLogs = pgTable("inventory_logs", {
 });
 
 // === RELATIONS ===
-export const productsRelations = relations(products, ({ many }) => ({
+export const storesRelations = relations(stores, ({ many }) => ({
+  products: many(products),
+  orders: many(orders),
+}));
+
+export const productsRelations = relations(products, ({ one, many }) => ({
+  store: one(stores, {
+    fields: [products.storeId],
+    references: [stores.id],
+  }),
   orderItems: many(orderItems),
   inventoryLogs: many(inventoryLogs),
 }));
 
 export const ordersRelations = relations(orders, ({ one, many }) => ({
+  store: one(stores, {
+    fields: [orders.storeId],
+    references: [stores.id],
+  }),
   items: many(orderItems),
-  // No direct relation to users table defined here because users is in a separate file, 
-  // but we can join manually if needed or just fetch user data separately.
 }));
 
 export const orderItemsRelations = relations(orderItems, ({ one }) => ({
@@ -78,6 +103,9 @@ export const orderItemsRelations = relations(orderItems, ({ one }) => ({
 }));
 
 // === TYPES ===
+export type Store = typeof stores.$inferSelect;
+export type InsertStore = z.infer<typeof insertStoreSchema>;
+
 export type Product = typeof products.$inferSelect;
 export type InsertProduct = z.infer<typeof insertProductSchema>;
 
@@ -89,6 +117,7 @@ export type InsertOrderItem = z.infer<typeof insertOrderItemSchema>;
 
 // Custom Types for API
 export type CreateOrderRequest = {
+  storeId: number;
   items: { productId: number; quantity: number }[];
   paymentMethod: "mpesa" | "card";
 };
